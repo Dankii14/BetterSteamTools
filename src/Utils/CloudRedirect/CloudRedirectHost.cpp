@@ -1,13 +1,17 @@
 #include "CloudRedirectHost.h"
 
 #include "OSTPlatform/include/DynamicLibrary.h"
+#include "OSTPlatform/include/SteamCredentialStore.h"
+#include "OSTPlatform/include/Thread.h"
 #include "Utils/Config/Config.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/Logging/Log.h"
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace CloudRedirectHost {
@@ -70,6 +74,48 @@ namespace {
         if (lib.is_absolute())
             return lib;
         return std::filesystem::path(steamRoot) / lib;
+    }
+
+    // CloudRedirect cannot seed stats from the cloud or upload them until it knows
+    // the account: without it every cloud operation degrades to a safe no-op
+    // ("[Stats] SeedApps: no accountId after 30 s, aborting", "[NS] ... no Steam
+    // account ID after 200ms"). The host used to forward the account from the
+    // steamid field of an outbound CMsgClientGamesPlayed header, which current
+    // Steam builds leave empty, so CR never left account=0. The client publishes
+    // the active account id in the registry, which does not depend on any packet
+    // layout, so read it from there instead.
+    uint32_t ReadActiveAccountId() {
+        uint32_t accountId = 0;
+        std::wstring universe;
+        if (OSTPlatform::SteamCredentialStore::GetActiveUser(accountId, universe)
+                != OSTPlatform::SteamCredentialStore::Status::Ok)
+            return 0;
+        return accountId;
+    }
+
+    // Logon finishes after the host is already initialised, so retry rather than
+    // treating the first empty read as "no account". Stops on the first hit. CR
+    // gives seeding up after 30 s without an account id, so the retry stays
+    // inside that window.
+    void StartAccountIdWatcher() {
+        static std::atomic<bool> s_started{false};
+        if (s_started.exchange(true)) return;
+
+        OSTPlatform::Thread::StartDetached([] () -> uint32_t {
+            for (int attempt = 0; attempt < 25; ++attempt) {
+                if (!g_active.load(std::memory_order_acquire)) return 0;
+
+                const uint32_t accountId = ReadActiveAccountId();
+                if (accountId != 0 && g_setAccountId) {
+                    g_setAccountId(accountId);
+                    LOG_DEBUG("CloudRedirect: account id {} published to cloud_redirect", accountId);
+                    return 0;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            LOG_WARN("CloudRedirect: no account id after 25 s, cloud ops stay no-op");
+            return 0;
+        });
     }
 
     template <typename T>
@@ -141,6 +187,10 @@ void Initialize(const char* steamInstallPath) {
     g_active.store(true, std::memory_order_release);
     LOG_INFO("CloudRedirect: loaded {} and initialised cloud save redirection",
              libPath.string());
+
+    // Stats seeding and cloud-save uploads are both gated on the account id, so
+    // hand it over as early as possible.
+    if (g_setAccountId) StartAccountIdWatcher();
 
     if (g_enableStatsSync) {
         g_enableStatsSync(true, true);
